@@ -512,10 +512,9 @@ def get_game_spreads(home, away, odds_data):
 
 def simulate_spread_pro(home_id, away_id, stats_db, b2b_set, player_db, injured_list, spread_line_home):
     """
-    Suorittaa Monte Carlo -simulaation huomioiden:
-    1. Four Factors Matchup-edut (Heitto, Levyt, Menetykset, Vaparit)
-    2. Dynaamiset loukkaantumiset (Smart Injury Impact)
-    3. Kotiedun ja rasituksen (B2B)
+    PURE FOUR FACTORS MODEL (v6.1 Updated)
+    Ennustaa tehokkuuden suoraan neljästä faktorista (eFG, TOV, ORB, FT)
+    ja lisää sen jälkeen HCA, B2B ja loukkaantumisvaikutukset.
     """
     if home_id not in stats_db or away_id not in stats_db:
         return 0, 0, 0, [], [], [] 
@@ -524,114 +523,108 @@ def simulate_spread_pro(home_id, away_id, stats_db, b2b_set, player_db, injured_
     a = stats_db[away_id]
     notes = []
     
-    # --- 1. BASELINE STATS (LÄHTÖTASO) ---
-    h_off, h_def = h['OFF_RTG'], h['DEF_RTG']
-    a_off, a_def = a['OFF_RTG'], a['DEF_RTG']
+    # --- 1. MATCHUP ENGINE: ENNUSTETAAN PELIN TILASTOT ---
+    # Logiikka: (Oma Hyökkäys + Vastustajan Puolustus) / 2
     
-    # --- 2. FOUR FACTORS HEURISTIC ADJUSTMENT (MATCHUP ENGINE) ---
-    # Lasketaan, saako joukkue etua vastustajan heikkouksista.
-    # Tämä estää tuplalaskennan vertaamalla matchupia joukkueen omaan keskiarvoon.
-
-    # A. HEITTOPELI (Shooting - EFG%)
-    # Oletus: Ottelun heittotarkkuus on (Oma Taito + Vastustajan Puolustus) / 2
+    # Heittotarkkuus (eFG%)
     h_proj_efg = (h['FF_EFG'] + a['DEF_EFG']) / 2
     a_proj_efg = (a['FF_EFG'] + h['DEF_EFG']) / 2
     
-    # Delta: Kuinka paljon paremmin/huonommin heitämme tässä pelissä vs. normaali?
-    h_efg_diff = h_proj_efg - h['FF_EFG']
-    a_efg_diff = a_proj_efg - a['FF_EFG']
-    
-    h_off += h_efg_diff * WEIGHT_EFG
-    a_off += a_efg_diff * WEIGHT_EFG
-
-    # B. LEVYPALLOT (Rebounding - OREB%)
-    h_proj_orb = (h['FF_ORB'] + a['DEF_ORB']) / 2
-    a_proj_orb = (a['FF_ORB'] + h['DEF_ORB']) / 2
-    
-    h_off += (h_proj_orb - h['FF_ORB']) * WEIGHT_ORB
-    a_off += (a_proj_orb - a['FF_ORB']) * WEIGHT_ORB
-
-    # C. MENETYKSET (Turnovers - TOV%)
-    # Huom: TOV on "negatiivinen" tilasto, joten logiikka on käänteinen.
-    # Jos vastustaja pakottaa paljon virheitä (korkea DEF_TOV), hyökkäysteho laskee.
+    # Menetykset (TOV%)
     h_proj_tov = (h['FF_TOV'] + a['DEF_TOV']) / 2
     a_proj_tov = (a['FF_TOV'] + h['DEF_TOV']) / 2
     
-    # Jos ennustettu TOV% on korkeampi kuin oma keskiarvo -> vähennetään pisteitä
-    h_off -= (h_proj_tov - h['FF_TOV']) * WEIGHT_TOV
-    a_off -= (a_proj_tov - a['FF_TOV']) * WEIGHT_TOV
-
-    # D. VAPAAHEITOT (Free Throws - FTA Rate)
-    # Jos joukkue kalastaa virheitä ja vastustaja rikkoo paljon -> etu
+    # Hyökkäyslevypallot (OREB%)
+    h_proj_orb = (h['FF_ORB'] + a['DEF_ORB']) / 2
+    a_proj_orb = (a['FF_ORB'] + h['DEF_ORB']) / 2
+    
+    # Vapaaheitot (FTA Rate)
     h_proj_fta = (h['FF_FTA'] + a['DEF_FTA']) / 2
     a_proj_fta = (a['FF_FTA'] + h['DEF_FTA']) / 2
+
+    # --- 2. MUUNNETAAN TILASTOT PISTEIKSI (Efficiency per 100 poss) ---
+    # Käytetään regressiokertoimia muuttamaan %-luvut pisteodotusarvoksi.
     
-    h_off += (h_proj_fta - h['FF_FTA']) * 15.0 # Käytetään tässä 15.0 jos WEIGHT_FTA puuttuu
-    a_off += (a_proj_fta - a['FF_FTA']) * 15.0
+    def calculate_implied_ortg(efg, tov, orb, fta):
+        # Base constant: NBA:n keskiarvoteho ilman muuttujia on n. 15-20 pts pohjalla
+        base = 18.0 
+        
+        pts_efg = efg * 200.0     # 50% eFG -> 100 pistettä
+        pts_tov = tov * -100.0    # 15% TOV -> -15 pistettä (menetys on kallis)
+        pts_orb = orb * 50.0      # 25% ORB -> +12.5 pistettä (lisähallinnat)
+        pts_fta = fta * 18.0      # 20% FTA -> +3.6 pistettä
+        
+        return base + pts_efg + pts_tov + pts_orb + pts_fta
 
-    # Kirjataan merkittävät edut ylös Exceliä varten
-    if h_efg_diff > 0.015: notes.append("Home Shoot Adv")
-    if a_efg_diff > 0.015: notes.append("Away Shoot Adv")
-    if (h_proj_tov - h['FF_TOV']) > 0.02: notes.append("Risk: Home TOV")
+    # Lasketaan "Raaka" hyökkäysteho (ilman loukkaantumisia/rasitusta)
+    h_raw_eff = calculate_implied_ortg(h_proj_efg, h_proj_tov, h_proj_orb, h_proj_fta)
+    a_raw_eff = calculate_implied_ortg(a_proj_efg, a_proj_tov, a_proj_orb, a_proj_fta)
 
-    # --- 3. HCA (HOME COURT ADVANTAGE) ---
+    # --- 3. KOTIETU (HCA) ---
     current_hca = DEFAULT_HCA
     if "NUGGETS" in h['NAME'].upper(): current_hca = 3.5
     elif "JAZZ" in h['NAME'].upper(): current_hca = 3.2
     elif "CELTICS" in h['NAME'].upper() or "KNICKS" in h['NAME'].upper(): current_hca = 2.7
     
-    # --- 4. B2B ADJUSTMENT ---
+    # Lisätään kotietu kotijoukkueen tehokkuuteen
+    h_raw_eff += current_hca
+
+    # --- 4. B2B ADJUSTMENT (Rasitus) ---
+    # Vähennetään rasittuneen joukkueen tehokkuutta
     if home_id in b2b_set:
-        h_off -= B2B_PENALTY
-        h_def += B2B_PENALTY 
+        h_raw_eff -= 2.0  # ~2 pistettä per 100 hallintaa
         notes.append("Home B2B")
     if away_id in b2b_set:
-        a_off -= B2B_PENALTY
-        a_def += B2B_PENALTY
+        a_raw_eff -= 2.0
         notes.append("Away B2B")
         
-    # --- 5. DYNAMIC INJURY ADJUSTMENT ---
+    # --- 5. LOUKKAANTUMISET (Smart Injury Impact) ---
+    # Haetaan vaikutus: off_loss (oma hyökkäys huononee) ja def_loss (oma puolustus huononee)
     h_off_loss, h_def_loss, h_missing = calculate_smart_injury_impact(home_id, player_db, injured_list, stats_db)
     a_off_loss, a_def_loss, a_missing = calculate_smart_injury_impact(away_id, player_db, injured_list, stats_db)
     
-    if h_off_loss > 0 or h_def_loss > 0:
-        h_off -= h_off_loss
-        h_def += h_def_loss 
-        
-    if a_off_loss > 0 or a_def_loss > 0:
-        a_off -= a_off_loss
-        a_def += a_def_loss
+    # A. Vähennetään OMASTA hyökkäyksestä poissaolijat
+    h_final_eff = h_raw_eff - h_off_loss
+    a_final_eff = a_raw_eff - a_off_loss
+    
+    # B. Lisätään hyökkäystehoa, jos VASTUSTAJAN puolustus on heikentynyt
+    # (Jos kotijoukkueelta puuttuu Rudy Gobert -> Vierasjoukkueen hyökkäys paranee)
+    h_final_eff += a_def_loss
+    a_final_eff += h_def_loss
 
-    # --- 6. GAME MATH & VARIANCE ---
+    # --- 6. VARIANSSI JA SIMULAATIO ---
+    
+    # Lisätään huomiot (Notes) Exceliä varten
+    if h_proj_efg > a_proj_efg + 0.025: notes.append("Home Shooting Edge")
+    if a_proj_efg > h_proj_efg + 0.025: notes.append("Away Shooting Edge")
+    if h_proj_orb > 0.30 and a['DEF_ORB'] > 0.30: notes.append("Home High REB Potential")
+
+    # Pelinopeus (Pace)
     pace = (h['PACE'] + a['PACE']) / 2
-    # Lasketaan odotusarvo (Efficiency per 100) päivitetyillä arvoilla
-    h_eff = (h_off + a_def) / 2 + current_hca
-    a_eff = (a_off + h_def) / 2
     
-    base_std_dev = 12.0
-    pace_factor = pace / 99.0 
-    adjusted_std_dev = base_std_dev * pace_factor
+    # Muutetaan tehokkuus (per 100) odotetuiksi pisteiksi (per Pace)
+    # TÄMÄ ON TÄRKEÄ KORJAUS: Nyt vertaamme oikeita pisteitä spreadiin
+    h_proj_pts = (h_final_eff * pace) / 100.0
+    a_proj_pts = (a_final_eff * pace) / 100.0
     
-    # --- 7. MONTE CARLO ---
-    h_sims = np.random.normal(h_eff, adjusted_std_dev, SIMULATIONS)
-    a_sims = np.random.normal(a_eff, adjusted_std_dev, SIMULATIONS)
+    # Keskihajonta skaalattuna pelinopeudella
+    base_std_dev = 13.5 # Hieman korkeampi, koska Four Factors -mallissa on enemmän liikkuvia osia
+    adjusted_std_dev = base_std_dev * (pace / 100.0)
+    
+    # Monte Carlo -ajo
+    h_sims = np.random.normal(h_proj_pts, adjusted_std_dev, SIMULATIONS)
+    a_sims = np.random.normal(a_proj_pts, adjusted_std_dev, SIMULATIONS)
+    
+    # Lasketaan kuinka usein kotijoukkue kattaa tasoituksen
+    # Spread on vedonlyönnissä: Home -3.5 tarkoittaa, että Home:n pitää voittaa yli 3.5:llä.
+    # Jos spread on -5, ja tulos on +6, Home covers.
+    # Logic: Margin (H - A) > -Spread (koska spread on yleensä merkitty negatiiviseksi suosikille API:ssa)
     
     sim_margins = h_sims - a_sims
     covers = (sim_margins > -spread_line_home).sum()
     cover_prob = (covers / SIMULATIONS) * 100
     
-    h_proj = (h_eff * pace) / 100
-    a_proj = (a_eff * pace) / 100
-    
-    # Audit logitus
-    game_audit = {
-        "home_team": h['NAME'],
-        "result": {"home_cover_prob": cover_prob}
-    }
-    audit_log["games_analyzed"].append(game_audit)
-    
-    return cover_prob, h_proj, a_proj, notes, h_missing, a_missing
-
+    return cover_prob, h_proj_pts, a_proj_pts, notes, h_missing, a_missing
 # ========================================================
 # 4. MAIN RUNNER
 # ========================================================
@@ -862,4 +855,5 @@ def trigger_run():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
+
     app.run(host='0.0.0.0', port=port)
