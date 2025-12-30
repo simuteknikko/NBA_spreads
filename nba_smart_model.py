@@ -40,6 +40,7 @@ install("scipy")
 install("requests")
 install("fuzzywuzzy")              # <--- NEW LINE
 install("python-levenshtein")      # <--- NEW LINE (for performance)
+install("scikit-learn")
 
 # --- IMPORTS ---
 from nba_api.stats.endpoints import leaguedashteamstats, scoreboardv2, leaguedashplayerstats, leaguegamelog
@@ -49,6 +50,7 @@ from nba_api.stats.static import teams
 #from selenium.webdriver.chrome.options import Options
 #from selenium.webdriver.common.by import By
 #from webdriver_manager.chrome import ChromeDriverManager
+from sklearn.linear_model import LinearRegression
 from fuzzywuzzy import fuzz
 
 # --- FLASK APP SETUP (Lisää tämä importtien jälkeen) ---
@@ -443,6 +445,62 @@ def get_blended_stats(season):
             print("Debug - Four Factors Columns:", ff.columns.tolist())
         return {}
 
+def calibrate_four_factors(season):
+    print("Step X: Calibrating Physics Engine (Linear Regression)...")
+    try:
+        # Haetaan joukkueiden tilastot (Advanced)
+        team_stats = leaguedashteamstats.LeagueDashTeamStats(
+            season=season,
+            measure_type_detailed_defense='Four Factors',
+            per_mode_detailed='Per100Possessions' # Tärkeä: Käytämme Per100Possessions dataa regressioon
+        ).get_data_frames()[0]
+
+        # Haetaan myös Offensive Rating (Advanced-näkymästä, tai lasketaan pisteistä)
+        # Huom: Four Factors endpointissa ei välttämättä ole OFF_RATING suoraan samassa skaalassa,
+        # joten varmistetaan hakemalla Advanced-data.
+        adv_stats = leaguedashteamstats.LeagueDashTeamStats(
+            season=season,
+            measure_type_detailed_defense='Advanced',
+            per_mode_detailed='Per100Possessions'
+        ).get_data_frames()[0]
+        
+        # Yhdistetään datat
+        merged = pd.merge(team_stats, adv_stats[['TEAM_ID', 'OFF_RATING']], on='TEAM_ID')
+        
+        # Määritellään muuttujat regressiolle
+        # X = Four Factors (eFG%, TOV%, ORB%, FT Rate)
+        # Y = Offensive Rating (Pisteet per 100 hallintaa)
+        
+        X = merged[['EFG_PCT', 'TM_TOV_PCT', 'OREB_PCT', 'FTA_RATE']]
+        y = merged['OFF_RATING']
+        
+        # Ajetaan lineaarinen regressio
+        model = LinearRegression()
+        model.fit(X, y)
+        
+        # Nämä ovat uudet "Fysiikkakertoimet"
+        coeffs = {
+            'BASE': model.intercept_,       # Vakiotermi (ns. pohjataso)
+            'EFG': model.coef_[0],          # Ennen: 175.0
+            'TOV': model.coef_[1],          # Ennen: -115.0
+            'ORB': model.coef_[2],          # Ennen: 55.0
+            'FTA': model.coef_[3]           # Ennen: 68.0
+        }
+        
+        print(f"   -> Calibration Complete. New Coefficients:")
+        print(f"      Base: {coeffs['BASE']:.2f}")
+        print(f"      eFG%: {coeffs['EFG']:.2f} (Impact of 1% shooting)")
+        print(f"      TOV%: {coeffs['TOV']:.2f} (Cost of turnover)")
+        print(f"      ORB%: {coeffs['ORB']:.2f} (Value of off rebound)")
+        print(f"      FTA : {coeffs['FTA']:.2f} (Value of FT rate)")
+        
+        return coeffs
+        
+    except Exception as e:
+        print(f"   -> WARNING: Calibration failed ({e}). Using fallback weights.")
+        # Palautetaan vanhat arvot varalle, jos API kaatuu
+        return {'BASE': 5.0, 'EFG': 175.0, 'TOV': -115.0, 'ORB': 55.0, 'FTA': 68.0}
+
 def get_schedule():
     print("Step 5: Fetching Upcoming Games...")
     today = datetime.now()
@@ -521,7 +579,7 @@ def get_game_spreads(home, away, odds_data):
 # 3. PRO SIMULATION ENGINE (AUDITABLE)
 # ========================================================
 
-def simulate_spread_pro(home_id, away_id, stats_db, b2b_set, player_db, injured_list, spread_line_home):
+def simulate_spread_pro(home_id, away_id, stats_db, b2b_set, player_db, injured_list, spread_line_home, coeffs):
     """
     PURE FOUR FACTORS MODEL (v6.1 Updated)
     Ennustaa tehokkuuden suoraan neljästä faktorista (eFG, TOV, ORB, FT)
@@ -557,32 +615,14 @@ def simulate_spread_pro(home_id, away_id, stats_db, b2b_set, player_db, injured_
     # Käytetään regressiokertoimia muuttamaan %-luvut pisteodotusarvoksi.
     
     def calculate_implied_ortg(efg, tov, orb, fta):
-        # --- PÄIVITETTY PURE FOUR FACTORS (Fysiikkapohjainen) ---
+        # --- DYNAAMINEN PURE FOUR FACTORS ---
+        # Käytetään regressiosta saatuja kertoimia
         
-        # Base: Vakio kalibroitu niin, että liigan keskiarvoilla tulos on n. 115.5 pistettä.
-        # (Laskettu kaavalla: 115.5 - Tilastollinen_Tuotto)
-        base = 5.0 
-        
-        # 1. eFG% (Effective Field Goal %)
-        # Kerroin 175.0: NBA-joukkue ottaa n. 87-88 heittoa per 100 hallintaa.
-        # 100% eFG toisi siis 2 * 87.5 = 175 pistettä.
-        pts_efg = efg * 175.0     
-        
-        # 2. TOV% (Turnover %)
-        # Kerroin -115.0: Yksi menetys maksaa keskimääräisen hyökkäyksen verran.
-        # Koska 100 hallintaa tuottaa n. 115 pistettä, yksi hukattu hallinta on -1.15 pistettä.
-        pts_tov = tov * -115.0    
-        
-        # 3. OREB% (Offensive Rebound %)
-        # Kerroin 55.0: Hyökkäyslevypallo antaa uuden 14s hallinnan.
-        # Regressioanalyysissä sen arvo on noin puolet täydestä korista.
-        pts_orb = orb * 55.0      
-        
-        # 4. FTA Rate (Free Throws per FGA)
-        # Kerroin 68.0: TÄRKEIN KORJAUS. Aiempi 18.0 oli väärin.
-        # Joukkue ottaa n. 88 heittoa. FTA Rate 1.0 = 88 vaparia.
-        # 88 vaparia * 78% tarkkuus = ~68 pistettä.
-        pts_fta = fta * 68.0      
+        base = coeffs['BASE']
+        pts_efg = efg * coeffs['EFG']
+        pts_tov = tov * coeffs['TOV']
+        pts_orb = orb * coeffs['ORB']
+        pts_fta = fta * coeffs['FTA']
         
         return base + pts_efg + pts_tov + pts_orb + pts_fta
 
@@ -668,6 +708,7 @@ def run_spread_pro():
     b2b_teams = get_b2b_teams()
     player_stats = get_all_player_stats(season)
     stats = get_blended_stats(season)
+    coeffs = calibrate_four_factors(season)
     games, date = get_schedule()
     
     if games.empty: print("No games."); return
@@ -690,7 +731,7 @@ def run_spread_pro():
             
         # KORJATTU: Otetaan vastaan 6 arvoa
         h_cov_pct, h_pts, a_pts, notes, h_inj_list, a_inj_list = simulate_spread_pro(
-            hid, aid, stats, b2b_teams, player_stats, injured, line_h
+            hid, aid, stats, b2b_teams, player_stats, injured, line_h, coeffs
         )
         
         # Formatoidaan loukkaantumislistat tekstiksi
@@ -887,5 +928,6 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
 
     app.run(host='0.0.0.0', port=port)
+
 
 
