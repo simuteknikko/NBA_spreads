@@ -557,13 +557,32 @@ def simulate_spread_pro(home_id, away_id, stats_db, b2b_set, player_db, injured_
     # Käytetään regressiokertoimia muuttamaan %-luvut pisteodotusarvoksi.
     
     def calculate_implied_ortg(efg, tov, orb, fta):
-        # Base constant: NBA:n keskiarvoteho ilman muuttujia on n. 15-20 pts pohjalla
-        base = 18.0 
+        # --- PÄIVITETTY PURE FOUR FACTORS (Fysiikkapohjainen) ---
         
-        pts_efg = efg * 200.0     # 50% eFG -> 100 pistettä
-        pts_tov = tov * -100.0    # 15% TOV -> -15 pistettä (menetys on kallis)
-        pts_orb = orb * 50.0      # 25% ORB -> +12.5 pistettä (lisähallinnat)
-        pts_fta = fta * 18.0      # 20% FTA -> +3.6 pistettä
+        # Base: Vakio kalibroitu niin, että liigan keskiarvoilla tulos on n. 115.5 pistettä.
+        # (Laskettu kaavalla: 115.5 - Tilastollinen_Tuotto)
+        base = 5.0 
+        
+        # 1. eFG% (Effective Field Goal %)
+        # Kerroin 175.0: NBA-joukkue ottaa n. 87-88 heittoa per 100 hallintaa.
+        # 100% eFG toisi siis 2 * 87.5 = 175 pistettä.
+        pts_efg = efg * 175.0     
+        
+        # 2. TOV% (Turnover %)
+        # Kerroin -115.0: Yksi menetys maksaa keskimääräisen hyökkäyksen verran.
+        # Koska 100 hallintaa tuottaa n. 115 pistettä, yksi hukattu hallinta on -1.15 pistettä.
+        pts_tov = tov * -115.0    
+        
+        # 3. OREB% (Offensive Rebound %)
+        # Kerroin 55.0: Hyökkäyslevypallo antaa uuden 14s hallinnan.
+        # Regressioanalyysissä sen arvo on noin puolet täydestä korista.
+        pts_orb = orb * 55.0      
+        
+        # 4. FTA Rate (Free Throws per FGA)
+        # Kerroin 68.0: TÄRKEIN KORJAUS. Aiempi 18.0 oli väärin.
+        # Joukkue ottaa n. 88 heittoa. FTA Rate 1.0 = 88 vaparia.
+        # 88 vaparia * 78% tarkkuus = ~68 pistettä.
+        pts_fta = fta * 68.0      
         
         return base + pts_efg + pts_tov + pts_orb + pts_fta
 
@@ -868,4 +887,5 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
 
     app.run(host='0.0.0.0', port=port)
+
 
