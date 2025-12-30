@@ -450,11 +450,22 @@ def get_schedule():
     try:
         board = scoreboardv2.ScoreboardV2(game_date=date_str)
         games = board.game_header.get_data_frame()
+        
+        # --- KORJAUS 1: Poistetaan tuplat heti haun jälkeen ---
+        # Tämä varmistaa, ettei sama GAME_ID esiinny listalla kahdesti
+        if not games.empty:
+            games = games.drop_duplicates(subset=['GAME_ID']) 
+
         if games.empty:
             print("   -> No games today. Checking tomorrow...")
             date_str = (today + timedelta(days=1)).strftime('%Y-%m-%d')
             board = scoreboardv2.ScoreboardV2(game_date=date_str)
             games = board.game_header.get_data_frame()
+            
+            # --- KORJAUS 2: Sama varmistus, jos haetaan huomisen pelit ---
+            if not games.empty:
+                games = games.drop_duplicates(subset=['GAME_ID'])
+
         return games, date_str
     except:
         return pd.DataFrame(), None
@@ -857,3 +868,4 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
 
     app.run(host='0.0.0.0', port=port)
+
