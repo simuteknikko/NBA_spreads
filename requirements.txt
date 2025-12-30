@@ -1,0 +1,12 @@
+flask
+gunicorn
+pandas
+numpy
+requests
+nba_api
+scipy
+fuzzywuzzy
+python-levenshtein
+gspread
+oauth2client
+openpyxl
