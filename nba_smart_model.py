@@ -73,15 +73,6 @@ AUDIT_FILE = 'model_audit_v5.json'
 # FIX: B2B Penalty adjusted to realistic levels (approx 2.0 net rating swing total)
 B2B_PENALTY = 1.0 
 
-# --- MODEL WEIGHTS (FOUR FACTORS) ---
-# Nämä määrittävät kuinka paljon yksi prosenttiyksikkö eroa vaikuttaa pisteisiin.
-# Esim. 40.0 tarkoittaa, että 1% ero tehokkuudessa (EFG) ~ 0.4 pistettä per posessio (tai skaalattuna).
-WEIGHT_EFG = 40.0   # Heittotehokkuus (Tärkein)
-WEIGHT_TOV = 25.0   # Pallonmenetykset
-WEIGHT_ORB = 20.0   # Hyökkäyslevypallot
-WEIGHT_FTA = 15.0   # UUSI: Vapaaheittojen määrä (Free Throw Rate)
-
-
 
 # GLOBAL AUDIT LOG
 audit_log = {
@@ -533,8 +524,9 @@ def get_schedule():
 # ========================================================
 
 def fetch_spread_odds():
-    print("Step 6: Fetching Odds from API...")
-    url = f"https://api.the-odds-api.com/v4/sports/basketball_nba/odds/?apiKey={ODDS_API_KEY}&regions=eu&markets=spreads&oddsFormat=decimal"
+    print("Step 6: Fetching Spread & Moneyline Odds from API...")
+    # LISÄTTY: markets=spreads,h2h
+    url = f"https://api.the-odds-api.com/v4/sports/basketball_nba/odds/?apiKey={ODDS_API_KEY}&regions=eu&markets=spreads,h2h&oddsFormat=decimal"
     try:
         response = requests.get(url)
         if response.status_code != 200: return {}
@@ -542,23 +534,43 @@ def fetch_spread_odds():
         odds_map = {} 
         for event in data:
             home, away = event['home_team'], event['away_team']
-            h_p, h_o, a_p, a_o = 0,0,0,0
-            found = False
+            # Alustetaan arvot
+            h_p, h_o, a_p, a_o = 0, 0, 0, 0 # Spread
+            h_ml, a_ml = 0, 0              # Moneyline (UUSI)
+            
+            found_spread = False
+            found_ml = False
             
             for bookie in event['bookmakers']:
                 for market in bookie['markets']:
+                    # 1. Spreadit
                     if market['key'] == 'spreads':
                         for outcome in market['outcomes']:
                             if outcome['name'] == home: h_p, h_o = outcome['point'], outcome['price']
                             elif outcome['name'] == away: a_p, a_o = outcome['point'], outcome['price']
-                        found = True; break
-                if found: break
+                        found_spread = True
+                    
+                    # 2. Moneyline (h2h)
+                    elif market['key'] == 'h2h':
+                        for outcome in market['outcomes']:
+                            if outcome['name'] == home: h_ml = outcome['price']
+                            elif outcome['name'] == away: a_ml = outcome['price']
+                        found_ml = True
+                
+                # Jos molemmat löytyivät samalta bookkerilta, break. (Tai jatketaan parhaan etsimistä)
+                if found_spread and found_ml: break
             
-            if found:
+            if found_spread or found_ml:
                 key = f"{normalize_team_name(away)} @ {normalize_team_name(home)}"
-                odds_map[key] = {'H_Pt': h_p, 'H_Od': h_o, 'A_Pt': a_p, 'A_Od': a_o}
+                odds_map[key] = {
+                    'H_Pt': h_p, 'H_Od': h_o, 
+                    'A_Pt': a_p, 'A_Od': a_o,
+                    'H_ML': h_ml, 'A_ML': a_ml # UUDET KENTÄT
+                }
         return odds_map
-    except: return {}
+    except Exception as e: 
+        print(f"Odds Error: {e}")
+        return {}
 
 def normalize_team_name(name):
     return name.replace("Los Angeles", "L.A.")
@@ -685,23 +697,25 @@ def simulate_spread_pro(home_id, away_id, stats_db, b2b_set, player_db, injured_
     h_sims = np.random.normal(h_proj_pts, adjusted_std_dev, SIMULATIONS)
     a_sims = np.random.normal(a_proj_pts, adjusted_std_dev, SIMULATIONS)
     
-    # Lasketaan kuinka usein kotijoukkue kattaa tasoituksen
-    # Spread on vedonlyönnissä: Home -3.5 tarkoittaa, että Home:n pitää voittaa yli 3.5:llä.
-    # Jos spread on -5, ja tulos on +6, Home covers.
-    # Logic: Margin (H - A) > -Spread (koska spread on yleensä merkitty negatiiviseksi suosikille API:ssa)
-    
+    # 1. SPREAD CALCULATION
     sim_margins = h_sims - a_sims
     covers = (sim_margins > -spread_line_home).sum()
     cover_prob = (covers / SIMULATIONS) * 100
     
-    return cover_prob, h_proj_pts, a_proj_pts, notes, h_missing, a_missing
+    # 2. MONEYLINE CALCULATION (UUSI)
+    # Lasketaan kuinka monta kertaa kotijoukkue teki enemmän pisteitä kuin vieras
+    wins = (h_sims > a_sims).sum()
+    win_prob = (wins / SIMULATIONS) * 100
+    
+    # Palautetaan myös win_prob (LISÄTTY TOISEKSI ARVOKSI)
+    return cover_prob, win_prob, h_proj_pts, a_proj_pts, notes, h_missing, a_missing
 # ========================================================
 # 4. MAIN RUNNER
 # ========================================================
 
 def run_spread_pro():
     season = get_current_season()
-    print(f"--- NBA SPREAD PRO v6.1 (Detail Report) ---\nSeason: {season}")
+    print(f"--- NBA SMART MODEL v6.2 (Spread & Moneyline) ---\nSeason: {season}")
     
     # 1. Fetch ALL Data
     injured = get_injured_players()
@@ -713,11 +727,14 @@ def run_spread_pro():
     
     if games.empty: print("No games."); return
 
-    # 2. Get Odds
+    # 2. Get Odds (Nyt sisältää ML)
     spreads = fetch_spread_odds()
     
     print(f"Simulating {len(games)} games for {date} with {SIMULATIONS} runs...")
-    results = []
+    
+    # Listat tuloksille
+    results_spread = []
+    results_ml = []
     
     nba_teams = teams.get_teams()
     team_map = {t['id']: t['full_name'] for t in nba_teams}
@@ -728,113 +745,125 @@ def run_spread_pro():
         
         odds = get_game_spreads(h_name, a_name, spreads)
         line_h = odds['H_Pt'] if odds else 0
-            
-        # KORJATTU: Otetaan vastaan 6 arvoa
-        h_cov_pct, h_pts, a_pts, notes, h_inj_list, a_inj_list = simulate_spread_pro(
+        
+        # --- KUTSU SIMULAATIOTA (NYT 7 PALUUARVOA) ---
+        h_cov_pct, h_win_pct, h_pts, a_pts, notes, h_inj_list, a_inj_list = simulate_spread_pro(
             hid, aid, stats, b2b_teams, player_stats, injured, line_h, coeffs
         )
         
-        # Formatoidaan loukkaantumislistat tekstiksi
+        # Formatoidaan datat
         h_inj_str = ", ".join(h_inj_list) if h_inj_list else "-"
         a_inj_str = ", ".join(a_inj_list) if a_inj_list else "-"
-
+        note_str = " | ".join(notes) if notes else ""
+        proj_score = f"{int(a_pts)} - {int(h_pts)}"
+        
+        # --- A. SPREAD DATA ---
         if odds:
             a_cov_pct = 100 - h_cov_pct
+            rec_spread = "-"
+            if h_cov_pct >= 62.5: rec_spread = "STRONG HOME"
+            elif h_cov_pct >= 57.0: rec_spread = "BET HOME"
+            elif a_cov_pct >= 62.5: rec_spread = "STRONG AWAY"
+            elif a_cov_pct >= 57.0: rec_spread = "BET AWAY"
             
-            STRONG_THRESH = 62.5
-            VALUE_THRESH = 57.0
-            
-            rec = "-"
-            if h_cov_pct >= STRONG_THRESH: rec = "STRONG HOME"
-            elif h_cov_pct >= VALUE_THRESH: rec = "BET HOME"
-            elif a_cov_pct >= STRONG_THRESH: rec = "STRONG AWAY"
-            elif a_cov_pct >= VALUE_THRESH: rec = "BET AWAY"
-            
-            note_str = " | ".join(notes) if notes else ""
-            
-            results.append({
+            results_spread.append({
                 'Match': f"{a_name} @ {h_name}",
                 'Spread': f"{line_h}",
-                'Proj Score': f"{int(a_pts)} - {int(h_pts)}",
-                'Proj Margin': round(h_pts - a_pts, 1),
+                'Proj Score': proj_score,
                 'Context': note_str,
-                # UUDET SARAKKEET:
-                'Home Injuries': h_inj_str,
-                'Away Injuries': a_inj_str,
-                
-                'Home Cover %': round(h_cov_pct, 1),
-                'Home Odds': odds['H_Od'],
-                'Away Cover %': round(a_cov_pct, 1),
-                'Away Odds': odds['A_Od'],
-                'RECOMMENDATION': rec,
-                'Confidence_Sort': abs(h_cov_pct - 50.0)
+                'Home Injuries': h_inj_str, 'Away Injuries': a_inj_str,
+                'Home Cover %': round(h_cov_pct, 1), 'Home Odds': odds['H_Od'],
+                'Away Cover %': round(a_cov_pct, 1), 'Away Odds': odds['A_Od'],
+                'RECOMMENDATION': rec_spread,
+                'Sort_Key': abs(h_cov_pct - 50.0)
             })
         else:
-            # Myös ilman kertoimia pitää käsitellä palautusarvot oikein
-            results.append({
+            results_spread.append({
+                'Match': f"{a_name} @ {h_name}", 'Spread': "N/A",
+                'Proj Score': proj_score, 'Context': note_str,
+                'Home Injuries': h_inj_str, 'Away Injuries': a_inj_str,
+                'Home Cover %': "-", 'RECOMMENDATION': "No Odds", 'Sort_Key': 0
+            })
+            
+        # --- B. MONEYLINE DATA (UUSI) ---
+        if odds and odds.get('H_ML', 0) > 0:
+            a_win_pct = 100 - h_win_pct
+            
+            # Kelly Criterion / Value Calculation for ML
+            # Value = (Probability * Odds) - 1. Jos > 0, se on ylikerroin.
+            h_ev = (h_win_pct / 100 * odds['H_ML']) - 1
+            a_ev = (a_win_pct / 100 * odds['A_ML']) - 1
+            
+            rec_ml = "-"
+            # Kynnysarvot: Esim. 5% ROI (EV > 0.05) on hyvä veto
+            if h_ev > 0.15: rec_ml = "STRONG HOME"
+            elif h_ev > 0.05: rec_ml = "BET HOME"
+            elif a_ev > 0.15: rec_ml = "STRONG AWAY"
+            elif a_ev > 0.05: rec_ml = "BET AWAY"
+
+            results_ml.append({
                 'Match': f"{a_name} @ {h_name}",
-                'Spread': "N/A",
-                'Proj Score': f"{int(a_pts)} - {int(h_pts)}",
-                'Context': " | ".join(notes),
-                'Home Injuries': h_inj_str,
-                'Away Injuries': a_inj_str,
-                'Home Cover %': "-", 'RECOMMENDATION': "No Odds",
-                'Confidence_Sort': 0
+                'Proj Score': proj_score,
+                'Context': note_str,
+                'Home Injuries': h_inj_str, 'Away Injuries': a_inj_str,
+                # Moneyline Specifics
+                'Home Win %': round(h_win_pct, 1),
+                'Home Odds': odds['H_ML'],
+                'Home EV': round(h_ev * 100, 1), # ROI %
+                'Away Win %': round(a_win_pct, 1),
+                'Away Odds': odds['A_ML'],
+                'Away EV': round(a_ev * 100, 1), # ROI %
+                'RECOMMENDATION': rec_ml,
+                'Sort_Key': max(h_ev, a_ev)
             })
 
-    # Save Audit Log (valinnainen, voi jättää lyhyeksi)
-    try:
-        with open(AUDIT_FILE, 'w') as f: json.dump(audit_log, f, indent=4)
-    except: pass
-
-    if results:
-        df = pd.DataFrame(results)
-        df = df.sort_values('Confidence_Sort', ascending=False).drop(columns=['Confidence_Sort'])
+    # --- GOOGLE SHEETS UPLOAD ---
+    if results_spread:
+        # Create DataFrames
+        df_spread = pd.DataFrame(results_spread).sort_values('Sort_Key', ascending=False).drop(columns=['Sort_Key'])
+        
+        df_ml = pd.DataFrame()
+        if results_ml:
+            df_ml = pd.DataFrame(results_ml).sort_values('Sort_Key', ascending=False).drop(columns=['Sort_Key'])
         
         print("   -> Connecting to Google Sheets...")
         try:
-            # 1. Load Credentials from Render Environment Variable
-            json_creds = os.environ.get('GOOGLE_CREDENTIALS_JSON')
-            
-            if not json_creds:
-                print("Error: Credentials not found in Environment Variables.")
-                return "Error: No Credentials"
-
-            creds_dict = json.loads(json_creds)
             scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-            creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+            creds = ServiceAccountCredentials.from_json_keyfile_name('credentials.json', scope)
             client = gspread.authorize(creds)
-
-            # 2. Open the Sheet
-            # TÄRKEÄÄ: Luo Google Sheetsiin uusi taulukko tällä nimellä tai muuta nimeä tässä:
-            SHEET_NAME = "NBA_Spread_Model_Output" 
             
+            SHEET_NAME = "NBA_Spread_Model_Output"
+            sh = client.open(SHEET_NAME)
+
+            # --- VÄLILEHTI 1: SPREADS ---
             try:
-                sheet = client.open(SHEET_NAME).sheet1
-            except gspread.SpreadsheetNotFound:
-                print(f"Error: Could not find sheet named '{SHEET_NAME}'.")
-                return f"Error: Sheet '{SHEET_NAME}' not found."
+                ws1 = sh.get_worksheet(0)
+            except:
+                ws1 = sh.add_worksheet(title="Spreads", rows="100", cols="20")
+            
+            ws1.clear()
+            ws1.update([df_spread.columns.values.tolist()] + df_spread.values.tolist())
+            ws1.format('A1:O1', {'textFormat': {'bold': True}, 'backgroundColor': {'red': 0.12, 'green': 0.28, 'blue': 0.49}, 'textFormat': {'foregroundColor': {'red': 1, 'green': 1, 'blue': 1}}})
+            print("   -> Updated Sheet 1 (Spreads)")
 
-            # 3. Upload Data
-            print("   -> Uploading data...")
-            sheet.clear() # Tyhjentää vanhan datan
-            
-            # Päivitetään data (otsikot + arvot)
-            sheet.update([df.columns.values.tolist()] + df.values.tolist())
-            
-            # 4. Format Header (Visuaalinen ilme)
-            sheet.format('A1:O1', {
-                'textFormat': {'bold': True}, 
-                'backgroundColor': {'red': 0.12, 'green': 0.28, 'blue': 0.49}, # "1F497D" vastaava RGB
-                'textFormat': {'foregroundColor': {'red': 1, 'green': 1, 'blue': 1}}
-            })
-            
-            # Huom: Ehdollinen muotoilu (värit suosituksille) kannattaa tehdä 
-            # suoraan Google Sheetsin "Conditional Formatting" -työkalulla,
-            # koska se on nopeampaa ja pysyvämpää kuin Pythonilla joka ajolla värittäminen.
-            
-            print(f"\nSUCCESS! Google Sheet '{SHEET_NAME}' updated.")
-            return "Success: Google Sheet Updated!"
+            # --- VÄLILEHTI 2: MONEYLINE ---
+            if not df_ml.empty:
+                try:
+                    # Yritetään hakea toinen välilehti (index 1)
+                    ws2 = sh.get_worksheet(1)
+                    if ws2 is None: # Jos index 1 ei ole olemassa
+                         ws2 = sh.add_worksheet(title="Moneyline", rows="100", cols="20")
+                except:
+                    # Jos haku epäonnistuu, luodaan uusi
+                    ws2 = sh.add_worksheet(title="Moneyline", rows="100", cols="20")
+
+                ws2.clear()
+                ws2.update([df_ml.columns.values.tolist()] + df_ml.values.tolist())
+                # Eri väri otsikoille jotta erottuu (Vihreä sävy)
+                ws2.format('A1:O1', {'textFormat': {'bold': True}, 'backgroundColor': {'red': 0.1, 'green': 0.35, 'blue': 0.15}, 'textFormat': {'foregroundColor': {'red': 1, 'green': 1, 'blue': 1}}})
+                print("   -> Updated Sheet 2 (Moneyline)")
+
+            return "Success: Sheets Updated!"
 
         except Exception as e:
             print(f"Google Sheets Error: {e}")
@@ -928,6 +957,7 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
 
     app.run(host='0.0.0.0', port=port)
+
 
 
 
