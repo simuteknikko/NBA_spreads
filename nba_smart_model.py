@@ -785,21 +785,43 @@ def run_spread_pro():
                 'Home Cover %': "-", 'RECOMMENDATION': "No Odds", 'Sort_Key': 0
             })
             
-        # --- B. MONEYLINE DATA (UUSI) ---
+        # --- B. MONEYLINE DATA (SMART FILTER) ---
         if odds and odds.get('H_ML', 0) > 0:
             a_win_pct = 100 - h_win_pct
             
-            # Kelly Criterion / Value Calculation for ML
-            # Value = (Probability * Odds) - 1. Jos > 0, se on ylikerroin.
+            # 1. Lasketaan Odotusarvo (ROI)
             h_ev = (h_win_pct / 100 * odds['H_ML']) - 1
             a_ev = (a_win_pct / 100 * odds['A_ML']) - 1
             
             rec_ml = "-"
-            # Kynnysarvot: Esim. 5% ROI (EV > 0.05) on hyvä veto
-            if h_ev > 0.15: rec_ml = "STRONG HOME"
-            elif h_ev > 0.05: rec_ml = "BET HOME"
-            elif a_ev > 0.15: rec_ml = "STRONG AWAY"
-            elif a_ev > 0.05: rec_ml = "BET AWAY"
+            
+            # --- UUSI SUODATUSLOGIIKKA ---
+            # Hylätään "roskavedot" (liian pieni osumatodennäköisyys), vaikka kerroin olisi korkea.
+            # Asetetaan rajaksi esim. 35% tai 40%.
+            
+            MIN_PROBABILITY = 38.0  # Älä suosittele, jos mallin mielestä voittosanssi on alle 38%
+            
+            # Kotijoukkueen analyysi
+            if h_ev > 0.03 and h_win_pct >= MIN_PROBABILITY:
+                if h_ev > 0.10 and h_win_pct > 50:
+                    rec_ml = "TOP PICK (High Win%)"   # Yli 50% osuma + kova ylikerroin
+                elif h_ev > 0.05 and h_win_pct > 40:
+                    rec_ml = "STRONG VALUE"           # Se "Sweet Spot": 40-50% ja hyvä arvo
+                elif h_ev > 0.03:
+                    rec_ml = "VALUE"
+            
+            # Vierasjoukkueen analyysi
+            elif a_ev > 0.03 and a_win_pct >= MIN_PROBABILITY:
+                if a_ev > 0.10 and a_win_pct > 50:
+                    rec_ml = "TOP PICK (High Win%)"
+                elif a_ev > 0.05 and a_win_pct > 40:
+                    rec_ml = "STRONG VALUE"
+                elif a_ev > 0.03:
+                    rec_ml = "VALUE"
+
+            # Jos on kova ylikerroin mutta pieni todennäköisyys, merkitään se varoituksella
+            if rec_ml == "-" and (h_ev > 0.15 or a_ev > 0.15):
+                rec_ml = "(High Risk / Longshot)"
 
             results_ml.append({
                 'Match': f"{a_name} @ {h_name}",
@@ -809,12 +831,13 @@ def run_spread_pro():
                 # Moneyline Specifics
                 'Home Win %': round(h_win_pct, 1),
                 'Home Odds': odds['H_ML'],
-                'Home EV': round(h_ev * 100, 1), # ROI %
+                'Home EV': round(h_ev * 100, 1), 
                 'Away Win %': round(a_win_pct, 1),
                 'Away Odds': odds['A_ML'],
-                'Away EV': round(a_ev * 100, 1), # ROI %
+                'Away EV': round(a_ev * 100, 1), 
                 'RECOMMENDATION': rec_ml,
-                'Sort_Key': max(h_ev, a_ev)
+                # Lajitellaan nyt ensisijaisesti suosituksen laadun, sitten EV:n mukaan
+                'Sort_Key': h_ev if rec_ml in ["TOP PICK", "STRONG VALUE"] else (a_ev if "VALUE" in rec_ml else -1)
             })
 
     # --- GOOGLE SHEETS UPLOAD ---
@@ -957,6 +980,7 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
 
     app.run(host='0.0.0.0', port=port)
+
 
 
 
