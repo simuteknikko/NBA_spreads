@@ -849,10 +849,16 @@ def run_spread_pro():
         if results_ml:
             df_ml = pd.DataFrame(results_ml).sort_values('Sort_Key', ascending=False).drop(columns=['Sort_Key'])
         
-        print("   -> Connecting to Google Sheets...")
+        print("   -> Connecting to Google Sheets (Render Mode)...")
         try:
             scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-            creds = ServiceAccountCredentials.from_json_keyfile_name('credentials.json', scope)
+            
+            # --- KORJAUS: Luetaan tunnukset suoraan Renderin ympäristömuuttujasta ---
+            # Tämä vaatii, että Renderissä on asetettu muuttuja: GOOGLE_CREDENTIALS_JSON
+            creds_dict = json.loads(os.environ['GOOGLE_CREDENTIALS_JSON'])
+            creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+            # ------------------------------------------------------------------------
+
             client = gspread.authorize(creds)
             
             SHEET_NAME = "NBA_Spread_Model_Output"
@@ -980,6 +986,7 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
 
     app.run(host='0.0.0.0', port=port)
+
 
 
 
